@@ -65,6 +65,8 @@ BlockAIOCB *blk_aio_zone_append(BlockBackend *blk, int64_t *offset,
                                 BlockCompletionFunc *cb, void *opaque);
 BlockAIOCB *blk_aio_pdiscard(BlockBackend *blk, int64_t offset, int64_t bytes,
                              BlockCompletionFunc *cb, void *opaque);
+BlockAIOCB *blk_aio_verify(BlockBackend *blk, int64_t offset, int64_t bytes,
+                           BlockCompletionFunc *cb, void *opaque);
 void blk_aio_cancel_async(BlockAIOCB *acb);
 BlockAIOCB *blk_aio_ioctl(BlockBackend *blk, unsigned long int req, void *buf,
                           BlockCompletionFunc *cb, void *opaque);

@@ -164,6 +164,21 @@ static void virtio_blk_discard_write_zeroes_complete(void *opaque, int ret)
     g_free(req);
 }
 
+static void virtio_blk_verify_complete(void *opaque, int ret)
+{
+    VirtIOBlockReq *req = opaque;
+    VirtIOBlock *s = req->dev;
+
+    trace_virtio_blk_verify_complete(VIRTIO_DEVICE(s), req, ret);
+
+    if (ret && virtio_blk_handle_rw_error(req, -ret, true, false)) {
+        return;
+    }
+
+    virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
+    g_free(req);
+}
+
 static VirtIOBlockReq *virtio_blk_get_request(VirtIOBlock *s, VirtQueue *vq)
 {
     VirtIOBlockReq *req = virtqueue_pop(vq, sizeof(VirtIOBlockReq));
@@ -445,6 +460,52 @@ err:
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_WRITE);
     }
     return err_status;
+}
+
+static uint8_t virtio_blk_handle_verify(VirtIOBlockReq *req,
+    struct virtio_blk_verify *verify_hdr)
+{
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    uint64_t sector;
+    uint32_t num_sectors, reserved;
+    int64_t bytes;
+
+    sector = virtio_ldq_p(vdev, &verify_hdr->sector);
+    num_sectors = virtio_ldl_p(vdev, &verify_hdr->num_sectors);
+    reserved = virtio_ldl_p(vdev, &verify_hdr->reserved);
+
+    /*
+     * max_verify_sectors is at most BDRV_REQUEST_MAX_SECTORS, this check
+     * makes us sure that "num_sectors << BDRV_SECTOR_BITS" can fit in
+     * the integer variable.
+     */
+    if (unlikely(num_sectors > s->conf.max_verify_sectors)) {
+        return VIRTIO_BLK_S_IOERR;
+    }
+
+    bytes = (int64_t)num_sectors << BDRV_SECTOR_BITS;
+
+    if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
+        return VIRTIO_BLK_S_IOERR;
+    }
+
+    /* Reserved field must be zero */
+    if (unlikely(reserved != 0)) {
+        return VIRTIO_BLK_S_UNSUPP;
+    }
+
+    trace_virtio_blk_handle_verify(vdev, req, sector, num_sectors);
+
+    /*
+     * Issue hardware verify via BLKVERIFY/FS_IOC_VERIFY_RANGE ioctl.
+     * This passes through to the underlying storage for true hardware
+     * verification instead of software read-and-discard emulation.
+     */
+    blk_aio_verify(s->blk, sector << BDRV_SECTOR_BITS, bytes,
+                   virtio_blk_verify_complete, req);
+
+    return VIRTIO_BLK_S_OK;
 }
 
 typedef struct ZoneCmdData {
@@ -957,6 +1018,43 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
 
         break;
     }
+    /*
+     * VIRTIO_BLK_T_VERIFY uses an odd command type so the descriptor
+     * is sent as an OUT buffer (device-readable), like DISCARD/WRITE_ZEROES.
+     */
+    case VIRTIO_BLK_T_VERIFY & ~VIRTIO_BLK_T_OUT:
+    {
+        struct virtio_blk_verify verify_hdr;
+        size_t out_len = iov_size(out_iov, out_num);
+        uint8_t err_status;
+
+        /*
+         * Unsupported if VIRTIO_BLK_T_OUT is not set or the descriptor
+         * size doesn't match.
+         */
+        if (unlikely(!(type & VIRTIO_BLK_T_OUT) ||
+                     out_len != sizeof(verify_hdr))) {
+            virtio_blk_req_complete(req, VIRTIO_BLK_S_UNSUPP);
+            g_free(req);
+            return 0;
+        }
+
+        if (unlikely(iov_to_buf(out_iov, out_num, 0, &verify_hdr,
+                                sizeof(verify_hdr)) != sizeof(verify_hdr))) {
+            iov_discard_undo(&req->inhdr_undo);
+            iov_discard_undo(&req->outhdr_undo);
+            virtio_error(vdev, "virtio-blk verify header too short");
+            return -1;
+        }
+
+        err_status = virtio_blk_handle_verify(req, &verify_hdr);
+        if (err_status != VIRTIO_BLK_S_OK) {
+            virtio_blk_req_complete(req, err_status);
+            g_free(req);
+        }
+
+        break;
+    }
     default:
     {
         /*
@@ -1219,6 +1317,10 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
                      bs->bl.max_append_sectors);
     } else {
         blkcfg.zoned.model = VIRTIO_BLK_Z_NONE;
+    }
+    if (virtio_has_feature(s->host_features, VIRTIO_BLK_F_VERIFY)) {
+        virtio_stl_p(vdev, &blkcfg.max_verify_sectors,
+                     s->conf.max_verify_sectors);
     }
     memcpy(config, &blkcfg, s->config_size);
 }
@@ -1764,6 +1866,16 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (virtio_has_feature(s->host_features, VIRTIO_BLK_F_VERIFY) &&
+        (!conf->max_verify_sectors ||
+         conf->max_verify_sectors > BDRV_REQUEST_MAX_SECTORS)) {
+        error_setg(errp, "invalid max-verify-sectors property (%" PRIu32
+                   "), must be between 1 and %d",
+                   conf->max_verify_sectors,
+                   (int)BDRV_REQUEST_MAX_SECTORS);
+        return;
+    }
+
     s->config_size = virtio_get_config_size(&virtio_blk_cfg_size_params,
                                             s->host_features);
     virtio_init(vdev, VIRTIO_ID_BLOCK, s->config_size);
@@ -1879,6 +1991,10 @@ static const Property virtio_blk_properties[] = {
                        conf.max_discard_sectors, BDRV_REQUEST_MAX_SECTORS),
     DEFINE_PROP_UINT32("max-write-zeroes-sectors", VirtIOBlock,
                        conf.max_write_zeroes_sectors, BDRV_REQUEST_MAX_SECTORS),
+    DEFINE_PROP_BIT64("verify", VirtIOBlock, host_features,
+                      VIRTIO_BLK_F_VERIFY, true),
+    DEFINE_PROP_UINT32("max-verify-sectors", VirtIOBlock,
+                       conf.max_verify_sectors, BDRV_REQUEST_MAX_SECTORS),
     DEFINE_PROP_BOOL("x-enable-wce-if-config-wce", VirtIOBlock,
                      conf.x_enable_wce_if_config_wce, true),
 };

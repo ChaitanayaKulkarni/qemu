@@ -31,6 +31,8 @@ static const VirtIOFeature feature_sizes[] = {
      .end = endof(struct virtio_blk_config, write_zeroes_may_unmap)},
     {.flags = 1ULL << VIRTIO_BLK_F_ZONED,
      .end = endof(struct virtio_blk_config, zoned)},
+    {.flags = 1ULL << VIRTIO_BLK_F_VERIFY,
+     .end = endof(struct virtio_blk_config, max_verify_sectors)},
     {}
 };
 

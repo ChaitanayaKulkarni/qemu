@@ -42,6 +42,7 @@
 #define VIRTIO_BLK_F_WRITE_ZEROES	14	/* WRITE ZEROES is supported */
 #define VIRTIO_BLK_F_SECURE_ERASE	16 /* Secure Erase is supported */
 #define VIRTIO_BLK_F_ZONED		17	/* Zoned block device */
+#define VIRTIO_BLK_F_VERIFY		18	/* VERIFY is supported */
 
 /* Legacy feature bits */
 #ifndef VIRTIO_BLK_NO_LEGACY
@@ -146,6 +147,13 @@ struct virtio_blk_config {
 		uint8_t model;
 		uint8_t unused2[3];
 	} zoned;
+
+	/* the next entry is guarded by VIRTIO_BLK_F_VERIFY */
+	/*
+	 * The maximum verify sectors (in 512-byte sectors) for
+	 * one segment.
+	 */
+	__virtio32 max_verify_sectors;
 } QEMU_PACKED;
 
 /*
@@ -170,6 +178,9 @@ struct virtio_blk_config {
 
 /* Cache flush command */
 #define VIRTIO_BLK_T_FLUSH	4
+
+/* Verify command (odd number for OUT descriptor direction) */
+#define VIRTIO_BLK_T_VERIFY	7
 
 /* Get device ID command */
 #define VIRTIO_BLK_T_GET_ID    8
@@ -300,6 +311,16 @@ struct virtio_blk_discard_write_zeroes {
 	uint32_t num_sectors;
 	/* flags for this range */
 	uint32_t flags;
+};
+
+/* Verify range descriptor. */
+struct virtio_blk_verify {
+	/* verify start sector */
+	uint64_t sector;
+	/* number of sectors to verify */
+	uint32_t num_sectors;
+	/* reserved, must be zero */
+	uint32_t reserved;
 };
 
 #ifndef VIRTIO_BLK_NO_LEGACY

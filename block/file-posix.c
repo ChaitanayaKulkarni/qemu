@@ -85,6 +85,20 @@
 #ifndef FS_NOCOW_FL
 #define FS_NOCOW_FL                     0x00800000 /* Do not cow file */
 #endif
+/* BLKVERIFY ioctl for block device verification (kernel 6.x+) */
+#ifndef BLKVERIFY
+#define BLKVERIFY _IO(0x12, 143)
+#endif
+/* FS_IOC_VERIFY_RANGE ioctl for file verification (kernel 6.x+) */
+#ifndef FS_IOC_VERIFY_RANGE
+struct fsverify_range {
+    uint64_t offset;
+    uint64_t len;
+    uint32_t flags;
+    uint32_t reserved;
+};
+#define FS_IOC_VERIFY_RANGE _IOW('X', 63, struct fsverify_range)
+#endif
 #endif
 #if defined(CONFIG_FALLOCATE_PUNCH_HOLE) || defined(CONFIG_FALLOCATE_ZERO_RANGE)
 #include <linux/falloc.h>
@@ -2350,6 +2364,46 @@ static int handle_aiocb_discard(void *opaque)
     return ret;
 }
 
+#ifdef __linux__
+/*
+ * Handle verify requests by issuing the appropriate ioctl.
+ * For block devices: BLKVERIFY
+ * For regular files: FS_IOC_VERIFY_RANGE
+ */
+static int handle_aiocb_verify(void *opaque)
+{
+    RawPosixAIOData *aiocb = opaque;
+    int ret = -ENOTSUP;
+
+    if (aiocb->aio_type & QEMU_AIO_BLKDEV) {
+        /* Block device - use BLKVERIFY ioctl */
+        uint64_t range[2] = { aiocb->aio_offset, aiocb->aio_nbytes };
+        do {
+            if (ioctl(aiocb->aio_fildes, BLKVERIFY, range) == 0) {
+                return 0;
+            }
+        } while (errno == EINTR);
+        ret = -errno;
+    } else {
+        /* Regular file - use FS_IOC_VERIFY_RANGE ioctl */
+        struct fsverify_range range = {
+            .offset = aiocb->aio_offset,
+            .len = aiocb->aio_nbytes,
+            .flags = 0,
+            .reserved = 0,
+        };
+        do {
+            if (ioctl(aiocb->aio_fildes, FS_IOC_VERIFY_RANGE, &range) == 0) {
+                return 0;
+            }
+        } while (errno == EINTR);
+        ret = -errno;
+    }
+
+    return ret;
+}
+#endif /* __linux__ */
+
 /*
  * Help alignment probing by allocating the first block.
  *
@@ -3674,6 +3728,47 @@ raw_co_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes)
     return raw_do_pdiscard(bs, offset, bytes, false);
 }
 
+#ifdef __linux__
+static coroutine_fn int
+raw_do_verify(BlockDriverState *bs, int64_t offset, int64_t bytes, bool blkdev)
+{
+    BDRVRawState *s = bs->opaque;
+    RawPosixAIOData acb;
+
+    acb = (RawPosixAIOData) {
+        .bs             = bs,
+        .aio_fildes     = s->fd,
+        .aio_type       = QEMU_AIO_VERIFY,
+        .aio_offset     = offset,
+        .aio_nbytes     = bytes,
+    };
+
+    if (blkdev) {
+        acb.aio_type |= QEMU_AIO_BLKDEV;
+    }
+
+    return raw_thread_pool_submit(handle_aiocb_verify, &acb);
+}
+
+static coroutine_fn int
+raw_co_verify(BlockDriverState *bs, int64_t offset, int64_t bytes)
+{
+    return raw_do_verify(bs, offset, bytes, false);
+}
+
+static coroutine_fn int
+hdev_co_verify(BlockDriverState *bs, int64_t offset, int64_t bytes)
+{
+    int ret;
+
+    ret = fd_open(bs);
+    if (ret < 0) {
+        return ret;
+    }
+    return raw_do_verify(bs, offset, bytes, true);
+}
+#endif /* __linux__ */
+
 static int coroutine_fn
 raw_do_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
                      BdrvRequestFlags flags, bool blkdev)
@@ -4002,6 +4097,9 @@ BlockDriver bdrv_file = {
     .bdrv_co_pwritev        = raw_co_pwritev,
     .bdrv_co_flush_to_disk  = raw_co_flush_to_disk,
     .bdrv_co_pdiscard       = raw_co_pdiscard,
+#ifdef __linux__
+    .bdrv_co_verify         = raw_co_verify,
+#endif
     .bdrv_co_copy_range_from = raw_co_copy_range_from,
     .bdrv_co_copy_range_to  = raw_co_copy_range_to,
     .bdrv_refresh_limits = raw_refresh_limits,
@@ -4472,6 +4570,9 @@ static BlockDriver bdrv_host_device = {
     .bdrv_co_pwritev        = raw_co_pwritev,
     .bdrv_co_flush_to_disk  = raw_co_flush_to_disk,
     .bdrv_co_pdiscard       = hdev_co_pdiscard,
+#ifdef __linux__
+    .bdrv_co_verify         = hdev_co_verify,
+#endif
     .bdrv_co_copy_range_from = raw_co_copy_range_from,
     .bdrv_co_copy_range_to  = raw_co_copy_range_to,
     .bdrv_refresh_limits = raw_refresh_limits,

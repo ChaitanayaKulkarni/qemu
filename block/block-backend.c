@@ -1831,6 +1831,39 @@ int coroutine_fn blk_co_pdiscard(BlockBackend *blk, int64_t offset,
 }
 
 /* To be called between exactly one pair of blk_inc/dec_in_flight() */
+static int coroutine_fn blk_co_do_verify(BlockBackend *blk,
+                                         int64_t offset, int64_t bytes)
+{
+    IO_CODE();
+    blk_wait_while_drained(blk);
+    GRAPH_RDLOCK_GUARD();
+
+    if (!blk_co_is_available(blk)) {
+        return -ENOMEDIUM;
+    }
+
+    return bdrv_co_verify(blk->root, offset, bytes);
+}
+
+static void coroutine_fn blk_aio_verify_entry(void *opaque)
+{
+    BlkAioEmAIOCB *acb = opaque;
+    BlkRwCo *rwco = &acb->rwco;
+
+    rwco->ret = blk_co_do_verify(rwco->blk, rwco->offset, acb->bytes);
+    blk_aio_complete(acb);
+}
+
+BlockAIOCB *blk_aio_verify(BlockBackend *blk,
+                           int64_t offset, int64_t bytes,
+                           BlockCompletionFunc *cb, void *opaque)
+{
+    IO_CODE();
+    return blk_aio_prwv(blk, offset, bytes, NULL, blk_aio_verify_entry, 0,
+                        cb, opaque);
+}
+
+/* To be called between exactly one pair of blk_inc/dec_in_flight() */
 static int coroutine_fn blk_co_do_flush(BlockBackend *blk)
 {
     IO_CODE();

@@ -591,6 +591,14 @@ struct BlockDriver {
         BlockDriverState *bs, int64_t offset, int64_t bytes);
 
     /*
+     * Verify that data can be read from the specified range.
+     * Uses hardware verification (BLKVERIFY/FS_IOC_VERIFY_RANGE) when available.
+     * Returns 0 on success, negative error code on failure.
+     */
+    int coroutine_fn GRAPH_RDLOCK_PTR (*bdrv_co_verify)(
+        BlockDriverState *bs, int64_t offset, int64_t bytes);
+
+    /*
      * Map [offset, offset + nbytes) range onto a child of @bs to copy from,
      * and invoke bdrv_co_copy_range_from(child, ...), or invoke
      * bdrv_co_copy_range_to() if @bs is the leaf child to copy data from.

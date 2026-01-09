@@ -3245,6 +3245,63 @@ out:
     return ret;
 }
 
+int coroutine_fn bdrv_co_verify(BdrvChild *child, int64_t offset, int64_t bytes)
+{
+    BlockDriverState *bs = child->bs;
+    int ret;
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    if (!bs || !bs->drv || !bdrv_co_is_inserted(bs)) {
+        return -ENOMEDIUM;
+    }
+
+    ret = bdrv_check_request(offset, bytes, NULL);
+    if (ret < 0) {
+        return ret;
+    }
+
+    bdrv_inc_in_flight(bs);
+
+    /* Try hardware verify if available */
+    if (bs->drv->bdrv_co_verify) {
+        ret = bs->drv->bdrv_co_verify(bs, offset, bytes);
+        fprintf(stderr, "VERIFY_DBG: driver %s has bdrv_co_verify, ret=%d\n",
+                bs->drv->format_name, ret);
+    } else {
+        ret = -ENOTSUP;
+        fprintf(stderr, "VERIFY_DBG: driver %s has NO bdrv_co_verify, ret=%d\n",
+                bs->drv->format_name, ret);
+    }
+
+    /*
+     * Fall back to read-based verification if hardware verify is not
+     * supported. We read the data and discard it - we only care about
+     * I/O errors indicating media problems.
+     */
+    if (ret == -ENOTSUP || ret == -EOPNOTSUPP) {
+        void *buf = qemu_blockalign(bs, bytes);
+        QEMUIOVector qiov;
+
+        fprintf(stderr, "VERIFY_DBG: fallback triggered for %s, doing read\n",
+                bs->drv->format_name);
+
+        qemu_iovec_init(&qiov, 1);
+        qemu_iovec_add(&qiov, buf, bytes);
+
+        ret = bdrv_co_preadv(child, offset, bytes, &qiov, 0);
+
+        fprintf(stderr, "VERIFY_DBG: fallback read ret=%d\n", ret);
+
+        qemu_iovec_destroy(&qiov);
+        qemu_vfree(buf);
+    }
+
+    bdrv_dec_in_flight(bs);
+
+    return ret;
+}
+
 int coroutine_fn bdrv_co_ioctl(BlockDriverState *bs, int req, void *buf)
 {
     BlockDriver *drv = bs->drv;
